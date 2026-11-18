@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub Notepad</title>
+<style>
+  :root { --bg:#f3f5f2; --panel:#fff; --ink:#1d2a24; --muted:#5d6b64; --line:#cdd6d0; --accent:#1f6b4f; --accent-ink:#fff; --err:#a32a2a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141a17; --panel:#1c2420; --ink:#e4ebe6; --muted:#97a69d; --line:#33403a; --accent:#5ec29a; --accent-ink:#0f1a15; --err:#ff8f8f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 Georgia, "Times New Roman", serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.6rem; margin: 0 0 16px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+  .row { display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; }
+  label { display:block; font-size:.9rem; color:var(--muted); margin-bottom:4px; }
+  input, textarea { width:100%; font:inherit; color:var(--ink); background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  textarea { min-height: 50vh; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size:.95rem; line-height:1.5; }
+  input:focus-visible, textarea:focus-visible, button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .actions { display:flex; gap:8px; align-items:center; margin-top:12px; flex-wrap:wrap; }
+  button { font:inherit; padding:8px 16px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:var(--accent-ink); cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { color:var(--muted); font-size:.9rem; }
+  #status.err { color:var(--err); }
+  details summary { cursor:pointer; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>GitHub Notepad</h1>
+
+  <details class="panel" id="settings" open>
+    <summary>GitHub connection</summary>
+    <div class="row" style="margin-top:12px">
+      <div><label for="token">Access token</label><input id="token" type="password" autocomplete="off" placeholder="github_pat_…"></div>
+      <div><label for="repo">Repository (owner/name)</label><input id="repo" placeholder="you/my-notes"></div>
+      <div><label for="path">File path</label><input id="path" value="notes.txt"></div>
+      <div><label for="branch">Branch (optional)</label><input id="branch" placeholder="default branch"></div>
+    </div>
+    <div class="actions">
+      <button id="saveSettings" class="secondary" type="button">Save connection</button>
+      <button id="forget" class="secondary" type="button">Forget token</button>
+    </div>
+  </details>
+
+  <div class="panel">
+    <label for="text">Your text</label>
+    <textarea id="text" placeholder="Type here, then save to GitHub."></textarea>
+    <div class="actions">
+      <button id="save" type="button">Save to GitHub</button>
+      <button id="load" class="secondary" type="button">Load from GitHub</button>
+      <span id="status" role="status"></span>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const COOKIE_KEYS = ['token', 'repo', 'path', 'branch'];
+let sha = null; // sha of the file's current version, needed for updates
+
+// ---- cookie helpers (falls back to localStorage if the browser blocks cookies, e.g. on file://) ----
+function setCookie(name, value, days = 365) {
+  const secure = location.protocol === 'https:' ? '; Secure' : '';
+  document.cookie = `${name}=${encodeURIComponent(value)}; max-age=${days * 86400}; path=/; SameSite=Strict${secure}`;
+  try { if (getCookie(name) !== value) localStorage.setItem('gh_' + name, value); } catch {}
+}
+function getCookie(name) {
+  const m = document.cookie.split('; ').find(c => c.startsWith(name + '='));
+  return m ? decodeURIComponent(m.slice(name.length + 1)) : null;
+}
+function readSetting(name) {
+  let v = getCookie(name);
+  if (v === null) { try { v = localStorage.getItem('gh_' + name); } catch {} }
+  return v;
+}
+function clearSetting(name) {
+  document.cookie = `${name}=; max-age=0; path=/`;
+  try { localStorage.removeItem('gh_' + name); } catch {}
+}
+
+function status(msg, isErr = false) {
+  const s = $('status'); s.textContent = msg; s.className = isErr ? 'err' : '';
+}
+
+// ---- UTF-8 safe base64 ----
+const toB64 = str => btoa(String.fromCharCode(...new TextEncoder().encode(str)));
+const fromB64 = b64 => new TextDecoder().decode(Uint8Array.from(atob(b64.replace(/\n/g, '')), c => c.charCodeAt(0)));
+
+function config() {
+  const token = $('token').value.trim(), repo = $('repo').value.trim(),
+        path = $('path').value.trim().replace(/^\/+/, ''), branch = $('branch').value.trim();
+  if (!token || !/^[^/\s]+\/[^/\s]+$/.test(repo) || !path) {
+    throw new Error('Enter a token, a repository as owner/name, and a file path.');
+  }
+  const url = `https://api.github.com/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
+  return { token, url, branch };
+}
+const headers = token => ({
+  'Authorization': `Bearer ${token}`,
+  'Accept': 'application/vnd.github+json',
+  'X-GitHub-Api-Version': '2022-11-28'
+});
+
+function persistSettings() {
+  COOKIE_KEYS.forEach(k => { const v = $(k).value.trim(); v ? setCookie(k, v) : clearSetting(k); });
+}
+
+async function load() {
+  try {
+    const { token, url, branch } = config();
+    status('Loading…');
+    const res = await fetch(url + (branch ? `?ref=${encodeURIComponent(branch)}` : ''), { headers: headers(token), cache: 'no-store' });
+    if (res.status === 404) { sha = null; status('File not found yet. Saving will create it.'); return; }
+    if (!res.ok) throw new Error(`GitHub said ${res.status}: ${(await res.json().catch(() => ({}))).message || res.statusText}`);
+    const data = await res.json();
+    sha = data.sha;
+    $('text').value = fromB64(data.content);
+    status('Loaded.');
+  } catch (e) { status(e.message, true); }
+}
+
+async function save() {
+  try {
+    const { token, url, branch } = config();
+    $('save').disabled = true; status('Saving…');
+    persistSettings();
+    const body = { message: `Update ${$('path').value.trim()} from GitHub Notepad`, content: toB64($('text').value) };
+    if (sha) body.sha = sha;
+    if (branch) body.branch = branch;
+    const res = await fetch(url, { method: 'PUT', headers: { ...headers(token), 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!res.ok) {
+      const msg = (await res.json().catch(() => ({}))).message || res.statusText;
+      throw new Error(res.status === 409 || res.status === 422
+        ? 'The file changed on GitHub. Load it again before saving.'
+        : `GitHub said ${res.status}: ${msg}`);
+    }
+    sha = (await res.json()).content.sha;
+    status('Saved to GitHub.');
+  } catch (e) { status(e.message, true); }
+  finally { $('save').disabled = false; }
+}
+
+// ---- init ----
+COOKIE_KEYS.forEach(k => { const v = readSetting(k); if (v) $(k).value = v; });
+if ($('token').value && $('repo').value) { $('settings').open = false; load(); }
+
+$('save').onclick = save;
+$('load').onclick = load;
+$('saveSettings').onclick = () => { persistSettings(); status('Connection saved.'); };
+$('forget').onclick = () => { clearSetting('token'); $('token').value = ''; status('Token removed.'); };
+document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); save(); } });
+</script>
+</body>
+</html>
